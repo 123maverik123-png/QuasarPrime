@@ -1,0 +1,156 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  QuasarPrime — шаблон конфигурации
+#
+#  Скопируй в config.toml и заполни api_key:
+#      copy config.example.toml config.toml      (Windows)
+#      cp   config.example.toml config.toml      (Linux/macOS)
+#
+#  Любой ключ можно переопределить переменной окружения ALICE_<СЕКЦИЯ>_<КЛЮЧ>,
+#  например:  ALICE_LLM_API_KEY=sk-...   ALICE_SERVER_HTTPS_PORT=8443
+# ─────────────────────────────────────────────────────────────────────────────
+
+[server]
+host = "0.0.0.0"
+https_port = 443          # станция ходит на 443; 0 — не поднимать HTTPS
+http_port = 80            # мок активации/проверок; 0 — не поднимать HTTP
+certfile = "certs/server.crt"
+keyfile = "certs/server.key"
+# Что подставить станции в uniproxyUrl. Пусто — оставить стандартный wss://uniproxy...
+public_uniproxy_url = ""
+data_dir = "data"
+log_level = "INFO"
+log_traffic = true        # весь JSON-трафик uniproxy в data/traffic/*.jsonl (для отладки)
+access_log = false        # access-лог uvicorn (шумно)
+
+# ── keep-alive WebSocket (ДВА независимых слоя; не отключай оба сразу) ───────
+# Слой 1 — транспорт WS (RFC 6455): сервер шлёт PING-фреймы, чтобы NAT не
+# закрыл соединение по тишине.
+#   ws_ping_interval — раз в сколько секунд; "none"/0 — выключить.
+#   ws_ping_timeout  — "none": пинговать, но не рвать соединение, если PONG не
+#                      пришёл; число — закрыть через N секунд (детектор мёртвого линка).
+ws_ping_interval = 15
+ws_ping_timeout = "none"
+
+# Слой 2 — протокол Алисы: прикладной keep-alive. Прошивка закрывает WSS через
+# ~10 c без ПРИКЛАДНОГО сообщения и WS-пинги за таковые не считает.
+#   "push" — System.Push, станция отвечает System.Ack (рабочий режим);
+#   "ping" — System.Ping (станция не объявляет его поддерживаемым);
+#   "none" — выключить.
+ws_keepalive_mode = "push"
+ws_keepalive_interval = 5
+ws_ping_timeout_ms = 10000  # PingTimeout/PongTimeout внутри TPing
+
+# Служебные флаги протокола — менять только если понимаешь, что делаешь.
+sync_connection_data = true
+sync_keep_message_id = false
+push_notify = false       # лишний System.Push сразу после синхронизации
+proto_ack = true          # отвечать на Proto-события прошивок 3.x
+
+[asr]
+engine = "gigaam"         # gigaam | openai (совместимый /v1/audio/transcriptions)
+model = "v3_e2e_rnnt"     # GigaAM v3 с пунктуацией; v3_e2e_ctc — чуть быстрее
+device = "auto"           # auto | cpu | cuda
+language = "ru"
+# Silero VAD: определяет конец фразы и вырезает тишину перед распознаванием
+vad_silence_ms = 700      # пауза, после которой фраза считается законченной
+vad_threshold = 0.5
+vad_energy_db = -68.0
+max_utterance_ms = 10000
+no_speech_timeout_ms = 5000
+partial_interval_ms = 300
+
+[llm]
+# Любой OpenAI-совместимый API со стримингом. По умолчанию — DeepSeek.
+base_url = "https://api.deepseek.com/v1"
+api_key = ""              # ключ с https://platform.deepseek.com/api_keys
+model = "deepseek-chat"
+temperature = 0.6
+max_tokens = 200
+timeout_s = 60
+history_turns = 8
+history_ttl_s = 300       # через 5 минут тишины диалог начинается заново
+listen_after_question = true
+hold_response_ms = 400    # сколько ждать конца ответа LLM после готовой первой фразы
+# extra_body = { reasoning_effort = "none" }   # для «размышляющих» моделей
+# Альтернативы: Groq (https://api.groq.com/openai/v1), OpenRouter,
+# локальный Ollama (http://127.0.0.1:11434/v1).
+
+# Характер ассистента. Можно вынести в файл и указать system_prompt_file —
+# файл перечитывается на лету, перезапуск не нужен.
+system_prompt_file = "system_prompt.txt"
+system_prompt = """Ты — Оптимус Прайм, голосовой ассистент в умной колонке. Отвечай по-русски, кратко и разговорно.
+
+ГЛАВНОЕ ПРАВИЛО — МУЗЫКА ВСЕГДА ИДЁТ В YOUTUBE:
+Если пользователь просит включить, поставить, запустить, сыграть или найти песню, трек, исполнителя, группу, альбом, подборку или просто музыку — ЛЮБУЮ, даже без слов «YouTube», «ютуб», «видео», «найди» — верни РОВНО одну строку и больше ничего:
+
+PLAY_YOUTUBE: <исполнитель и название>
+
+Требования к строке:
+1. После PLAY_YOUTUBE: только поисковый запрос: исполнитель и название.
+2. Убери слова «Алиса», «включи», «поставь», «запусти», «сыграй», «пожалуйста», «на YouTube», «с ютуба», кавычки и точку в конце.
+3. Не добавляй «Включаю», пояснения, markdown, обратные кавычки, приветствие или вторую строку.
+4. Не переводи название на английский и не придумывай исполнителя, если его не называли.
+5. Если названо только имя исполнителя — верни его; если ничего не названо («включи музыку», «поставь что-нибудь») — верни: PLAY_YOUTUBE: популярная музыка
+6. Если пользователь дал ссылку YouTube, верни её целиком после PLAY_YOUTUBE:
+7. Если это не просьба включить музыку (вопрос, погода, будильник, разговор, «включи свет»), отвечай как обычно, без PLAY_YOUTUBE.
+
+Примеры:
+Пользователь: Включи Кино Группа крови
+Ты: PLAY_YOUTUBE: Кино Группа крови
+
+Пользователь: Поставь Земфиру
+Ты: PLAY_YOUTUBE: Земфира
+
+Пользователь: Запусти на YouTube Кукла колдуна
+Ты: PLAY_YOUTUBE: Кукла колдуна
+
+Пользователь: Сыграй что-нибудь бодрое
+Ты: PLAY_YOUTUBE: популярная музыка
+
+Пользователь: Какая сегодня погода?
+Ты: Сегодня облачно, около пятнадцати градусов."""
+
+[tts]
+engine = "f5"                 # f5 (клон голоса) | edge (онлайн, запасной) | openai
+f5_url = "http://127.0.0.1:8777/v1"
+f5_voice_id = "ref_voice_1"   # метка эталона для кэша: сменил голос — смени метку
+# edge: voice = "ru-RU-SvetlanaNeural", rate = "+0%"
+cache = true
+
+[music]
+# Прямой доступ к Яндекс.Музыке (если нужен, помимо YouTube-моста).
+enabled = true
+token = ""                    # токен yandex-music (tools/music_login.py в оригинале)
+quality = "high"
+
+[youtube]
+# Мост quasard-youtube — внешний YouTube-плеер на Glagol-канале станции.
+enabled = true
+bridge_url = "http://127.0.0.1:8099"
+api_token = ""                # = server.api_token в конфиге quasard-youtube
+timeout_s = 10.0
+resume_timeout_s = 25.0
+next_timeout_s = 120.0
+status_ttl_s = 2.0
+
+[device]
+# Данные «умного дома», которые сервер отдаёт станции.
+name = "Яндекс Станция"
+display_name = "Хозяин"
+latitude = 55.7558
+longitude = 37.6173
+timezone = "Europe/Moscow"
+timezone_offset_sec = 10800
+
+# ── только для launcher.py ───────────────────────────────────────────────────
+[launcher]
+f5_python = ""            # отдельное окружение для F5 (если не хочешь ставить torch в основное)
+youtube_python = ""       # отдельное окружение для моста
+f5_port = 8777
+f5_nfe = 32               # 32 — качество, 16 — быстрее
+f5_ref = "voice/optimus_24k.wav"
+f5_ref_text = "voice/optimus.txt"
+bridge_dir = "quasard-youtube"
+wait_timeout = 180        # сколько ждать загрузки F5 (первый запуск качает веса)
+stop_timeout = 8
+log_dir = "logs"

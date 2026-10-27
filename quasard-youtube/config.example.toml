@@ -1,0 +1,84 @@
+# Пример конфигурации quasard-youtube.
+# Скопируйте в config.toml и заполните station.host / session_id / device_id.
+
+[station]
+# IP Яндекс Станции в локальной сети.
+host = "192.168.50.104"
+# Локальный Glagol WebSocket всегда на 1961 и всегда WSS с самоподписанным сертификатом.
+port = 1961
+# ID устройства и platform нужны для получения Glagol-токена.
+# Их можно посмотреть в логах quasard, в приложении «Дом с Алисой»
+# или получить автоматически: оставьте device_id пустым, если задан session_id.
+device_id = ""
+# Для Station Lite 2 (plum) — "plum", для Station Mini 2 — "yandexmidi".
+# Если device_id пуст, platform определится через API.
+platform = "plum"
+# Локальный quasard: /glagol/token и /glagol/check_token используют один ключ.
+token_url = "http://127.0.0.1:80/glagol/token"
+# Cookie Session_id от yandex.ru. Лучше не хранить здесь, а задать
+# переменную окружения YANDEX_SESSION_ID.
+session_id = "${YANDEX_SESSION_ID}"
+# Необязательно: своё имя устройства для выбора из списка устройств.
+device_name = ""
+# Таймауты, секунды.
+command_timeout = 5.0
+connect_timeout = 8.0
+
+[server]
+# Слушать на всех интерфейсах, иначе Станция не достанет поток.
+host = "0.0.0.0"
+port = 8099
+# IP, который будет записан в streamUrl. Пусто = определить по маршруту до Станции.
+advertise_host = ""
+# Сколько MP3-байт накопить до отправки команды (96 КиБ ≈ 4 с при 192 кбит/с).
+# Больше = надёжнее против сетевых провалов, но дольше старт.
+prebuffer_bytes = 98304
+prebuffer_timeout = 20.0
+# Сколько ждать, пока Станция откроет HTTP-поток после radio_play.
+station_connect_timeout = 15.0
+# Необязательный токен для /api/* (stream-URL защищён случайным токеном).
+api_token = ""
+
+[audio]
+bitrate_kbps = 192
+sample_rate = 44100
+channels = 2
+# Запас по длительности: компенсирует расхождение duration у YouTube и фактического MP3.
+padding_seconds = 2.0
+# Максимальная длительность одного трека; защита от «миксов на 10 часов».
+max_duration_seconds = 1800
+
+[youtube]
+# Пусто = найти yt-dlp в PATH, иначе запустить `python -m yt_dlp`.
+yt_dlp_path = ""
+ffmpeg_path = "ffmpeg"
+# Дополнительные аргументы yt-dlp, например для cookies/прокси:
+# extra_args = ["--cookies", "C:/secrets/youtube-cookies.txt"]
+extra_args = []
+# Таймаут поиска/извлечения метаданных.
+metadata_timeout = 45.0
+
+[playback]
+# radio_play — старая команда; на прошивке 0.369 (plum) она возвращает SUCCESS,
+# но не запускает поток. Для Lite 2 используйте audio_play.
+directive = "audio_play"
+# Отправлять `stop` перед новым треком. Помогает при переключении.
+stop_before_play = true
+# Ждать ли ответ Станции на команду. Многие прошивки не отвечают.
+wait_for_ack = false
+# Продолжение = переподключение потока: stop + audio_play(offset_ms) с новым url
+# (audio_play с уже загруженной ссылкой прошивка иногда игнорирует).
+# Сколько секунд ждать, пока Станция откроет поток заново.
+resume_connect_timeout = 4.0
+# Таймаут самих Glagol-команд продолжения (stop + audio_play).
+resume_command_timeout = 6.0
+# Сколько раз пробуем переподключить поток, прежде чем включить трек заново.
+resume_attempts = 2
+# Если Станция не переподключилась — включить трек заново с начала.
+resume_escalate_play = true
+
+[quasard]
+# Адрес локального bridge API; используется только Python-хуком.
+bridge_url = "http://127.0.0.1:8099"
+# Текст, который произнести, если после удаления команды ничего не осталось.
+empty_reply = "Включаю."

@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  QuasarPrime — зависимости
+#
+#  1) Сначала поставь PyTorch под свою видеокарту (для RTX 50xx нужен cu128):
+#       pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+#     Если этого не сделать, pip ниже притянет CPU-сборку: работать будет,
+#     но распознавание и синтез станут в разы медленнее.
+#  2) Затем:
+#       pip install -r requirements.txt
+#  3) F5-TTS при первом запуске сама скачает веса с HuggingFace (~1.5 ГБ).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── веб-стек сервера ──────────────────────────────────────────────────────────
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=12
+httpx>=0.27
+
+# ── аудио / ASR ───────────────────────────────────────────────────────────────
+numpy>=1.26
+av>=12                        # декодирование и кодирование Ogg/Opus (ffmpeg внутри колеса)
+onnxruntime>=1.17             # Silero VAD (quasard/assets/silero_vad.onnx)
+omegaconf>=2.3
+gigaam @ git+https://github.com/salute-developers/GigaAM   # ASR GigaAM v3
+
+# ── синтез речи ───────────────────────────────────────────────────────────────
+f5-tts>=1.1.22                # клон голоса (f5_server/f5_server.py)
+ruaccent>=1.5                 # ударения для русского перед F5
+soundfile>=0.12
+huggingface_hub>=0.24         # откуда F5 тянет веса
+
+# ── прочее ────────────────────────────────────────────────────────────────────
+protobuf>=5                   # protobuf-протокол uniproxy прошивок 3.x
+cryptography>=42              # свой CA и сертификаты (scripts/gen_certs.py)
+tzdata                        # часовые пояса на Windows
+edge-tts>=6                   # запасной TTS (онлайн, без ключа)
+yandex-music>=1.0             # музыка: поиск, «Моя волна» (quasard/music.py)
+aiohttp>=3.9                  # HTTP-сервер моста quasard-youtube
+yt-dlp>=2025.1.15             # YouTube для моста
+
+# ── PyTorch (см. пункт 1 в шапке — лучше ставить отдельной командой) ──────────
+torch>=2.4
+torchaudio>=2.4
