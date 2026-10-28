@@ -134,6 +134,8 @@ class StreamSession:
     duration: float
     content_length: int
     buffer: StreamBuffer
+    # id ролика YouTube — нужен панели для превью в мини-плеере
+    video_id: str = ""
     created_at: float = field(default_factory=time.time)
     connected: asyncio.Event = field(default_factory=asyncio.Event)
     finished: asyncio.Event = field(default_factory=asyncio.Event)
@@ -149,6 +151,22 @@ class StreamSession:
     paused: bool = False
     paused_at_bytes: int = 0
     resume_offset: int = 0
+    # Кто поставил паузу: "panel" (кнопка в панели) или "station" (кольцо на
+    # колонке, кнопка, голос). Разница нужна, чтобы не перепутать нашу паузу
+    # с чужой и чтобы «продолжай» знал, откуда брать позицию.
+    paused_by: str = ""
+    # ── состояние Станции (Glagol) ───────────────────────────────────────
+    # Станция раз в секунду присылает playing/progress. Через HTTP-поток паузу
+    # кольцом не видно: соединение остаётся открытым, байты просто перестают
+    # забираться. Поэтому позиция и пауза берутся из этих сообщений.
+    station_playing: bool = False
+    station_progress_ms: int = -1
+    station_progress_at: float = 0.0
+    station_silent_since: float = 0.0
+    seen_playing: bool = False
+    # Перемотка: с какой миллисекунды трека начинается этот поток (0 — с начала).
+    # Content-Length, позиция и оценка проигранного считаются от неё, а не от нуля.
+    start_ms: int = 0
     # номер «эпохи»: увеличивается при каждом resume. Старый HTTP-handler,
     # завершившись, не должен затирать состояние нового соединения.
     resume_epoch: int = 0
@@ -178,11 +196,18 @@ class StreamSession:
     error: str = ""
 
     @property
+    def stream_duration(self) -> float:
+        """Сколько звука в этом потоке: длительность трека минус начало перемотки."""
+        return max(0.001, float(self.duration) - self.start_ms / 1000.0)
+
+    @property
     def offset_ms(self) -> int:
         """Логическая позиция (мс) по байтовому смещению — для Glagol offset_ms."""
         if self.content_length <= 0 or self.duration <= 0:
             return 0
-        return int(self.resume_offset / self.content_length * self.duration * 1000)
+        return self.start_ms + int(
+            self.resume_offset / self.content_length * self.stream_duration * 1000
+        )
 
     def estimate_played_ms(self) -> int:
         """Сколько примерно уже проиграно (мс), а не отдано в буфер станции.
@@ -198,13 +223,18 @@ class StreamSession:
         один раз (``freeze_at_pause``): раньше каждое повторное «пауза»
         пересчитывало её по текущему времени, и offset_ms уезжал вперёд
         (лог 20:33:17 — 97405 мс, 20:33:25 — уже 105311 мс).
+
+        Для перемотанного потока позиция начинается со ``start_ms``: байты в
+        нём соответствуют не началу трека, а секунде, с которой он собран.
         """
         if self.content_length <= 0 or self.duration <= 0:
             return 0
-        rate = self.content_length / max(self.duration, 0.001)  # байт в секунду
+        duration = self.stream_duration
+        rate = self.content_length / duration  # байт в секунду
         elapsed_s = max(0.0, time.time() - self.started_sending_at) if self.started_sending_at else 0.0
         played_bytes = min(float(self.bytes_sent), self.stream_start_byte + elapsed_s * rate)
-        return max(0, int(played_bytes / self.content_length * self.duration * 1000))
+        played_ms = self.start_ms + max(0, int(played_bytes / self.content_length * duration * 1000))
+        return min(played_ms, int(self.duration * 1000))
 
     def behind_s(self, now: float | None = None) -> float:
         """Насколько Станция отстала от реального времени, секунды.
@@ -216,33 +246,124 @@ class StreamSession:
         """
         if not self.started_sending_at or self.content_length <= 0 or self.duration <= 0:
             return 0.0
-        rate = self.content_length / max(self.duration, 0.001)
+        rate = self.content_length / self.stream_duration
         clock = now if now is not None else time.time()
         expected = self.stream_start_byte + max(0.0, clock - self.started_sending_at) * rate
         return (expected - self.bytes_sent) / rate
 
-    def freeze_at_pause(self) -> None:
+    def position_byte(self, position_ms: int) -> int:
+        """Байт в этом потоке, с которого звучит абсолютная позиция ``position_ms``."""
+        if self.content_length <= 0 or self.duration <= 0:
+            return 0
+        rate = self.content_length / self.stream_duration  # байт в секунду
+        rel_s = (position_ms - self.start_ms) / 1000.0
+        rel_s = min(max(0.0, rel_s), self.stream_duration)
+        return int(rel_s * rate)
+
+    def freeze_at_pause(self, position_ms: int | None = None) -> None:
         """Зафиксировать позицию паузы ровно один раз.
 
         Повторная пауза («пауза», потом «поставь на паузу») не должна двигать
         позицию: Станция в это время уже ничего не читает.
+
+        ``position_ms`` — точная позиция от Станции (её ``playerState.progress``).
+        Без неё считаем по часам: байты в сокете опережают звук на минуты, потому
+        что Станция качает поток вперёд.
         """
         if self.paused:
             return
         self.paused = True
         self.paused_at_bytes = self.bytes_sent
-        self.resume_offset = self.bytes_sent
-        self.played_ms = self.estimate_played_ms()
+        if position_ms is None or position_ms < 0:
+            position_ms = self.estimate_played_ms()
+        position_ms = int(min(max(0, position_ms), int(self.duration * 1000)))
+        self.played_ms = position_ms
+        self.resume_offset = min(self.position_byte(position_ms), max(0, self.content_length - 1))
+
+    def apply_station_state(
+        self,
+        playing: bool,
+        progress_ms: int | None = None,
+        *,
+        pause_s: float = 1.5,
+        now: float | None = None,
+    ) -> bool:
+        """Учесть состояние Станции. True — она встала на паузу сама.
+
+        * ``playing`` — Станция реально звучит (её ``state.playing``);
+        * ``progress_ms`` — абсолютная позиция трека из ``playerState.progress``.
+
+        Пауза кольцом/кнопкой не закрывает HTTP-поток и не мешает байтам идти
+        в буфер, поэтому единственный признак — ``playing=false``. Несколько
+        секунд тишины ждём, чтобы короткий провал в сообщениях не превращался
+        в паузу, а после «договорила и продолжила» пауза снимается сама.
+        """
+        clock = now if now is not None else time.time()
+        self.station_playing = playing
+        # Позиции верим только когда Станция уже играла этот поток: сразу после
+        # audio_play она ещё присылает playerState прошлого трека (та же
+        # длительность — значит «наш»), и панель показывала бы чужую секунду.
+        if progress_ms is not None and progress_ms >= 0 and (playing or self.seen_playing):
+            self.station_progress_ms = progress_ms
+            self.station_progress_at = clock
+        if playing:
+            self.station_silent_since = 0.0
+            self.seen_playing = True
+            if self.paused_by == "station":
+                # Станция снова играет сама (например, договорила и продолжила).
+                self.paused = False
+                self.paused_by = ""
+                self.played_ms = 0
+            return False
+        if not self.seen_playing or self.finished.is_set() or self.cancelled:
+            return False
+        if not self.station_silent_since:
+            self.station_silent_since = clock
+        if clock - self.station_silent_since < pause_s:
+            return False
+        if self.paused:
+            return self.paused_by == "station"
+        fresh = (
+            self.station_progress_ms >= 0
+            and clock - self.station_progress_at <= 5.0
+        )
+        self.pause_at_station(self.station_progress_ms if fresh else None)
+        return True
+
+    def pause_at_station(self, position_ms: int | None = None) -> None:
+        """Станция встала (кольцо/кнопка/голос): зафиксировать её позицию."""
+        self.freeze_at_pause(position_ms)
+        self.paused_by = "station"
+
+    def reset_station_tracking(self) -> None:
+        """Забыть прошлое состояние Станции после переподключения потока."""
+        self.station_progress_ms = -1
+        self.station_progress_at = 0.0
+        self.station_silent_since = 0.0
+        self.seen_playing = False
+
+    def current_played_ms(self) -> int:
+        """Позиция трека для панели: у Станции она точнее наших часов."""
+        if self.paused:
+            return int(self.played_ms or self.estimate_played_ms())
+        if (
+            self.station_progress_ms >= 0
+            and time.time() - self.station_progress_at <= 5.0
+        ):
+            return min(self.station_progress_ms, int(self.duration * 1000))
+        return self.estimate_played_ms()
 
     def resume_position(self) -> tuple[int, int]:
         """(байт, мс) — откуда продолжать трек после паузы/обрыва потока.
 
-        Байт: сколько Станция уже забрала (после паузы это ``paused_at_bytes``).
+        Байт: ``resume_offset`` — байт, соответствующий позиции паузы. Раньше
+        здесь был ``bytes_sent`` (сколько Станция успела скачать), и без Range
+        от Станции трек прыгал вперёд на минуты.
         Мс: замороженная позиция (``played_ms``) — она уже согласована с тем,
         что видит Станция, поэтому пересчитывать её по байтам нельзя.
         """
         limit = max(0, self.content_length - 1)
-        raw = self.paused_at_bytes if self.paused else self.bytes_sent
+        raw = self.resume_offset if self.paused else self.bytes_sent
         offset_bytes = min(max(0, raw), limit)
         played_ms = self.played_ms or self.estimate_played_ms()
         played_ms = min(max(0, int(played_ms)), max(0, int(self.duration * 1000)))
@@ -294,20 +415,26 @@ class StreamSession:
                 else "waiting_station"
             ),
             "query": self.query,
+            "video_id": self.video_id,
             "title": self.title,
             "artist": self.artist,
             "duration": round(self.duration, 2),
+            "start_ms": self.start_ms,
             "content_length": self.content_length,
             "buffered": self.buffer.buffered_bytes,
             "bytes_sent": self.bytes_sent,
             "offset_ms": self.offset_ms,
-            "played_ms": self.played_ms or self.estimate_played_ms(),
+            "played_ms": self.current_played_ms(),
             "stalled_s": round(self.stalled_for(), 1),
             # Отрицательное/около нуля — Станция играет из своего буфера;
             # положительное — поток реально не читается.
             "behind_s": round(self.behind_s(), 1),
             "resume_offset": self.resume_offset,
             "paused": self.paused,
+            "paused_by": self.paused_by,
+            # Что Станция рассказала о себе сама: «играет/нет» и точная позиция.
+            "station_playing": self.station_playing,
+            "station_progress_ms": self.station_progress_ms,
             "station_connected": self.connected.is_set(),
             # «Есть что продолжать» — для кнопки play/pause и кольца Станции.
             # Поток после паузы может быть уже закрыт (state=finished или
@@ -659,6 +786,20 @@ def create_app(hub: StreamHub, control: ControlApi, api_token: str = "") -> web.
             return _json({"ok": False, "error": str(exc)}, 500)
         return _json({"ok": True, **result})
 
+    async def seek(request: web.Request) -> web.Response:
+        await require_auth(request)
+        payload = await body(request)
+        try:
+            position_ms = int(payload.get("position_ms"))
+        except (TypeError, ValueError):
+            return _json({"ok": False, "error": "position_ms is required"}, 400)
+        try:
+            result = await control.seek(position_ms)
+        except Exception as exc:  # noqa: BLE001 - API должен вернуть JSON
+            _LOGGER.exception("API /api/seek: %s", exc)
+            return _json({"ok": False, "error": str(exc)}, 500)
+        return _json({"ok": True, **result})
+
     async def volume(request: web.Request) -> web.Response:
         await require_auth(request)
         payload = await body(request)
@@ -683,6 +824,7 @@ def create_app(hub: StreamHub, control: ControlApi, api_token: str = "") -> web.
     app.router.add_post("/api/pause", pause)
     app.router.add_post("/api/resume", resume)
     app.router.add_post("/api/next", next_track)
+    app.router.add_post("/api/seek", seek)
     app.router.add_post("/api/volume", volume)
     app.router.add_get("/stream/{name}", hub.handle_stream, allow_head=True)
     return app

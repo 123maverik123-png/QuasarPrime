@@ -37,3 +37,7 @@ cache/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── сборки для релизов (лежат в assets релиза, не в git) ─────────────────────
+QuasarPrime*.rar
+QuasarPrime*.zip

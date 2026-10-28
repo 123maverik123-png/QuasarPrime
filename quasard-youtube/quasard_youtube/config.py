@@ -79,6 +79,11 @@ class AudioConfig:
     channels: int = 2
     padding_seconds: float = 2.0
     max_duration_seconds: int = 1800
+    # ffmpeg-фильтр громкости для музыки (`-af`). Пусто — без обработки.
+    # Примеры: "volume=-4.5dB" (ровно тише), "loudnorm=I=-18.6:TP=-2:LRA=11"
+    # (адаптивно, но добавляет задержку на анализ). Нужен, чтобы музыка не
+    # забивала голос ассистента: TTS в quasard-main нормализуется до -18.6 LUFS.
+    filter: str = ""
 
     @property
     def bytes_per_second(self) -> int:
@@ -89,6 +94,10 @@ class AudioConfig:
 class YoutubeConfig:
     yt_dlp_path: str = ""
     ffmpeg_path: str = "ffmpeg"
+    # Netscape-файл куки для yt-dlp (--cookies). Относительный путь ищется
+    # рядом с config.toml, затем в текущем каталоге. Пусто или файла нет —
+    # yt-dlp работает анонимно, как раньше.
+    cookies_file: str = "cookies.txt"
     extra_args: list[str] = field(default_factory=list)
     metadata_timeout: float = 45.0
 
@@ -98,11 +107,12 @@ class PlaybackConfig:
     directive: str = "radio_play"
     stop_before_play: bool = True
     wait_for_ack: bool = False
-    # Пауза: false — сервис только запоминает состояние, а саму паузу делает
-    # quasard директивой player_pause (поток остаётся открытым, «продолжай»
-    # возвращает трек с той же секунды). true — жёсткий stop через Glagol,
-    # тогда «продолжай» перезапускает трек с начала.
-    pause_command: bool = False
+    # Пауза: true — вместе с запоминанием позиции отправить Станции ``stop``.
+    # Мягкой паузы для audio_play у прошивки нет: и кольцо, и ``stop`` стирают
+    # сессию проигрывателя (в maind.log — audio_stop/player_finish), поэтому
+    # пауза без команды оставляла музыку играть. «Продолжай» возвращает трек с
+    # зафиксированной секунды, переподключив поток с offset_ms.
+    pause_command: bool = True
     # Продолжение = полное переподключение потока: stop -> audio_play(offset_ms)
     # с новым url. Сколько секунд ждать, пока Станция откроет HTTP-поток заново,
     # прежде чем считать попытку неудачной и перезапустить трек целиком.
@@ -185,6 +195,33 @@ class Config:
         if value.lower().startswith("session_id="):
             value = value.split("=", 1)[1]
         return value.strip().strip('"').strip("'")
+
+    def resolve_cookies_file(self) -> Path | None:
+        """Найти существующий файл куки для yt-dlp.
+
+        Возвращает ``None``, если ``youtube.cookies_file`` пуст или файла нет:
+        сервис должен работать и без куки. Относительный путь считается от
+        каталога config.toml, потом от текущего каталога — сервис часто
+        запускают из другого места (``C:\\quasard-main``).
+        """
+        raw = self.youtube.cookies_file.strip()
+        if not raw:
+            return None
+        path = Path(raw).expanduser()
+        candidates: list[Path] = []
+        if path.is_absolute():
+            candidates.append(path)
+        else:
+            if self.config_path is not None:
+                candidates.append(Path(self.config_path).parent / path)
+            candidates.append(Path.cwd() / path)
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.resolve()
+            except OSError:
+                continue
+        return None
 
     def resolve_advertise_host(self) -> str:
         """Определить IP, который видит Станция.

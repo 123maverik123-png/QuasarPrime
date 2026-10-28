@@ -33,7 +33,8 @@ quasard (ASR → DeepSeek) ── PLAY_YOUTUBE: query ──► POST /api/comman
 - локальный токен quasard `/glagol/token` + app-level ping каждые 5 с
   (прошивка закрывает WSS через ~10 с без него);
 - `audio_play` (рабочий путь для 0.369/plum) и `radio_play` (старые прошивки);
-- API `/api/command`, `/api/play`, `/api/stop`, `/api/status`;
+- API `/api/command`, `/api/play`, `/api/stop`, `/api/pause`, `/api/resume`,
+  `/api/next`, `/api/seek`, `/api/volume`, `/api/status`;
 - Python-хук для `quasard`, системный промпт и CLI-диагностика.
 
 ## Быстрый старт (Windows)
@@ -84,6 +85,29 @@ $env:YANDEX_SESSION_ID = "..."
 Если `device_id` пуст, при первом запуске сервис попробует получить список
 устройств через `iot.quasar.yandex.ru` и выбрать колонку по `station.host`
 или `station.device_name`.
+
+#### Куки YouTube (необязательно)
+
+Если YouTube просит «Sign in to confirm you're not a bot», требует вход для
+возрастных видео или аккаунт-специфичных треков — положите экспорт куки рядом
+с конфигом. Сервис сам передаст его в `--cookies` (через рабочую копию, чтобы
+yt-dlp не перезаписал ваш экспорт):
+
+```toml
+[youtube]
+cookies_file = "cookies.txt"   # рядом с config.toml; "" = никогда не передавать
+```
+
+Без файла yt-dlp работает анонимно, как раньше. Как получить `cookies.txt`,
+что делать с правами и почему файл нельзя коммитить — [docs/COOKIES.md](docs/COOKIES.md).
+Проверка: `python -m quasard_youtube doctor` покажет строки `cookies` и
+`JS-солвер`.
+
+> С куки обязательно нужны `pip install yt-dlp-ejs` и JS-рантайм
+> (`extra_args = ["--js-runtimes", "node"]`): авторизованная сессия ходит в
+> клиент `web`, которому нужна подпись форматов. Без солвера YouTube отдаёт
+> видео без аудио, и в логе будет «Аудиопоток пуст». `doctor` проверяет это
+> отдельной строкой.
 
 ### 3. Firewall
 
@@ -191,9 +215,41 @@ PLAY_YOUTUBE: <поисковый запрос>
 | `POST` | `/api/play` | `{"query": "...", "directive": "audio_play"}` |
 | `POST` | `/api/command` | разобрать ответ LLM целиком |
 | `POST` | `/api/stop` | остановить поток и отправить `stop` |
+| `POST` | `/api/pause` | пауза на Станции + запоминание позиции |
+| `POST` | `/api/resume` | продолжить с той же секунды |
+| `POST` | `/api/next` | следующий результат по тому же запросу |
+| `POST` | `/api/seek` | `{"position_ms": 180000}` — перемотка текущего трека |
+| `POST` | `/api/volume` | `{"level": 0..1}` или `{"delta": 1}` |
 | `GET` | `/api/status` | состояние станции/потока |
 | `GET` | `/healthz` | health-check |
 | `GET` | `/stream/<token>.mp3` | MP3 для Станции (только этот URL) |
+
+Перемотка пересобирает поток: `ffmpeg -ss` кодирует трек с нужной секунды,
+`Content-Length` считается от остатка, а Станции уходит `audio_play` с
+`offset_ms = 0` — она понимает offset как позицию **внутри потока**, поэтому
+иначе перескочила бы за конец короткого потока и сразу его завершила.
+Пауза/продолжение после перемотки отправляют Станции позицию внутри потока
+(`played_ms - start_ms`), а панели `status.played_ms` всегда отдаёт абсолютную.
+
+### Пауза: только жёсткая, и почему позиция берётся у Станции
+
+Мягкой паузы для `audio_play` у прошивки нет: кольцо на колонке и Glagol
+`{"command":"stop"}` дают одно и то же — `audio_stop`, `player_finish` и
+стирание сессии проигрывателя (видно в `maind.log` станции). Поэтому
+`/api/pause` по умолчанию (`playback.pause_command = true`) отправляет `stop`,
+без него музыка продолжала играть. «Продолжай» возвращает трек с
+зафиксированной секунды: поток переподключается с `offset_ms`.
+
+Позицию и факт паузы мост берёт из состояния Станции, а не из байтов: она раз
+в секунду присылает по Glagol `state.playing` и `playerState.progress`
+(позиция внутри отданного потока). Это важно в обе стороны:
+
+* пауза кольцом **не закрывает** HTTP-поток — байты просто перестают
+  забираться, поэтому раньше панель продолжала считать время; теперь
+  `playing=false` дольше 1.5 с превращается в `state=paused` с
+  `paused_by=station`;
+* `progress` точнее наших часов (Станция качает поток вперёд на минуты);
+  абсолютная позиция = `start_ms + progress`.
 
 Если задан `server.api_token`, `/api/*` требует `X-Api-Token` или
 `Authorization: Bearer ...`. Stream-URL защищён случайным токеном и живёт
@@ -231,15 +287,16 @@ quasard_youtube/
   command.py      # PLAY_YOUTUBE: ...
   protobuf.py     # externalCommandBypass (radio_play/audio_play)
   glagol.py       # WSS :1961, token, device discovery
-  youtube.py      # yt-dlp search/metadata
+  youtube.py      # yt-dlp search/metadata (+ --cookies)
+  cookies.py      # проверка cookies.txt (Netscape, авторизация)
   audio.py        # yt-dlp -> ffmpeg -> MP3, silence
   streaming.py    # HTTP-сервер, Content-Length, буфер
   service.py      # оркестрация
   quasard.py      # хук для alice_server
   __main__.py     # CLI: serve/play/doctor/parse
 prompts/          # системный промпт для DeepSeek
-docs/             # заметки по Glagol и патчу quasard
-tests/            # 29 unit/integration-тестов
+docs/             # заметки по Glagol, патчу quasard и куки (COOKIES.md)
+tests/            # unit/integration-тесты
 ```
 
 ## Тесты
@@ -255,11 +312,15 @@ python -m pytest -q
 
 ## Ограничения
 
-- Один трек за команду; нет очереди, `next`, `prev`, seek и прогресс-бара.
+- В мосте нет собственной очереди: один трек за команду, `next` ищет следующий
+  результат по тому же запросу, `seek` пересобирает поток с нужной секунды.
+  Очередь и история живут в панели (static/yt-player.js).
 - Прямые трансляции YouTube отклоняются: для них нельзя рассчитать
   `Content-Length`.
 - Треки длиннее `audio.max_duration_seconds` (30 мин по умолчанию)
-  отклоняются.
+  отклоняются. Это единственный лимит длительности в проекте: сообщение
+  «больше лимита 30 мин» — про него, а не про YouTube. Куки на него не влияют;
+  для длинных сборников поднимите значение (например, `14400`).
 - Старт занимает несколько секунд: поиск + prebuffer + буферизация Станции
   (~2–3 с).
 - `Content-Length` считается по метаданным. Если YouTube врёт о длительности,
@@ -281,7 +342,9 @@ python -m pytest -q
 | `Станция не подключилась к локальному HTTP-потоку` | firewall, `server.advertise_host`, доступность `http://IP:8099/healthz` с другого устройства |
 | `410 stream is not active` | Станция запросила старый URL; повторите команду |
 | `409 stream already being consumed` | Станция открыла второе соединение; перезапустите трек |
-| `yt-dlp ... Sign in to confirm you're not a bot` | добавьте cookies в `youtube.extra_args` |
+| `yt-dlp ... Sign in to confirm you're not a bot` | нужны куки: `youtube.cookies_file` → [docs/COOKIES.md](docs/COOKIES.md), проверка `doctor` |
+| `Трек длится N мин — больше лимита 30 мин` | это не YouTube, а `audio.max_duration_seconds` в `config.toml` |
+| `Куки: ... игнорируется` в логе | файл не в Netscape-формате; переэкспортируйте (см. `doctor`) |
 | `ffmpeg not found` | `where.exe ffmpeg`, `youtube.ffmpeg_path` |
 | Станция молчит, но HTTP-запросы идут | попробуйте `playback.directive = "audio_play"`; проверьте `-v` логи Glagol |
 

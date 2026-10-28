@@ -30,7 +30,7 @@ def test_play_orchestration(monkeypatch: pytest.MonkeyPatch) -> None:
         await buffer.finish()
         return content_length
 
-    async def fake_play(self, url, title="", subtitle="", *, directive=None):
+    async def fake_play(self, url, title="", subtitle="", *, directive=None, offset_ms=0):
         # Станция «подключилась» к потоку сразу после команды.
         holder["service"].hub.current.connected.set()
         return {"status": "SENT"}

@@ -16,6 +16,7 @@ from . import __version__
 from .audio import ensure_ffmpeg
 from .command import parse_command
 from .config import ConfigError, load_config
+from .cookies import inspect_cookies, js_solver_status
 from .glagol import GlagolClient, GlagolError
 from .service import PlaybackError, PlaybackService
 from .youtube import ResolveError, YoutubeResolver
@@ -116,6 +117,10 @@ async def _cmd_doctor(args: argparse.Namespace) -> int:
         problems += 1
         print(f"[FAIL] {label}: {detail}")
 
+    def warn(label: str, detail: str) -> None:
+        # Не увеличивает счётчик: без этого файла сервис штатно работает.
+        print(f"[WARN] {label}: {detail}")
+
     print(f"quasard-youtube {__version__}")
     print(f"config: {config.config_path or '(defaults)'}")
     try:
@@ -132,6 +137,43 @@ async def _cmd_doctor(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001
         resolver = None
         bad("yt-dlp", str(exc))
+
+    # Куки: без файла всё работает, поэтому отсутствие — WARN, а вот
+    # явно указанный, но непригодный файл — настоящая ошибка конфига.
+    configured_cookies = config.youtube.cookies_file.strip()
+    cookies_path = config.resolve_cookies_file()
+    if not configured_cookies:
+        print("[--]   cookies: youtube.cookies_file пуст — работаем анонимно")
+    elif cookies_path is None:
+        warn(
+            "cookies",
+            f"{configured_cookies} не найден — работаем анонимно, как раньше",
+        )
+    else:
+        report = inspect_cookies(cookies_path)
+        if not report.valid:
+            bad("cookies", f"{cookies_path}: {report.detail}")
+        else:
+            auth = (
+                "авторизация есть"
+                if report.authorized
+                else "НЕТ SID/LOGIN_INFO — YouTube не залогинен"
+            )
+            ok(
+                "cookies",
+                f"{cookies_path} (записей {report.entries}, "
+                f"youtube.com {report.youtube_entries}, {auth})",
+            )
+            # С авторизацией yt-dlp идёт в клиент, требующий JS-подписи.
+            solver_ready, solver_detail = js_solver_status(config.youtube.extra_args)
+            if solver_ready:
+                ok("JS-солвер", solver_detail)
+            else:
+                bad(
+                    "JS-солвер",
+                    f"{solver_detail}: с куки YouTube вернёт видео без аудио "
+                    "(см. docs/COOKIES.md)",
+                )
 
     try:
         advertise = config.resolve_advertise_host()

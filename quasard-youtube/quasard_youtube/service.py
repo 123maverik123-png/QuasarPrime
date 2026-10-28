@@ -16,7 +16,7 @@ from .command import parse_command
 from .config import Config
 from .glagol import GlagolClient
 from .streaming import StreamBuffer, StreamHub, StreamSession, create_app
-from .youtube import ResolveError, YoutubeResolver, looks_like_url
+from .youtube import ResolveError, TrackInfo, YoutubeResolver, looks_like_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ _STALL_S = 3.0
 # audio_play. Обычно мы снимаем свой handler сами, и это мгновенно; таймаут —
 # страховка от зависшей записи в сокет.
 _RELEASE_S = 2.0
+
+# Перемотку не даём ближе этого к концу: остаток короче не соберётся в валидный
+# MP3 с известной Content-Length, а слушать там уже нечего.
+_SEEK_TAIL_S = 3.0
 
 
 class PlaybackError(RuntimeError):
@@ -51,6 +55,9 @@ class PlaybackService:
         self._query = ""
         self._played: list[str] = []
         self._paused = False
+        # Когда в следующий раз пробовать подключиться к Станции для её состояния.
+        self._station_retry_at = 0.0
+        self._station_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         ensure_ffmpeg(self.config)
@@ -65,6 +72,9 @@ class PlaybackService:
             shutdown_timeout=3.0,
         )
         await self._site.start()
+        self._station_task = asyncio.create_task(
+            self._station_loop(), name="station-state"
+        )
         _LOGGER.info(
             "HTTP-сервер слушает %s:%d, для Станции: %s",
             self.config.server.host,
@@ -74,6 +84,11 @@ class PlaybackService:
 
     async def close(self) -> None:
         self._closing = True
+        if self._station_task is not None:
+            self._station_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._station_task
+            self._station_task = None
         async with self._lock:
             await self._cancel_watch()
             session = self.hub.current
@@ -106,8 +121,6 @@ class PlaybackService:
             if not self.config.station.host or not self.config.station.device_id:
                 await self.glagol.discover_device()
 
-            previous = self.hub.current
-
             # Новый запрос — новая очередь; тот же запрос — продолжаем листать.
             if query != self._query:
                 self._query = query
@@ -122,143 +135,227 @@ class PlaybackService:
             if track.duration > self.config.audio.max_duration_seconds:
                 raise PlaybackError(
                     f"Трек длится {track.duration / 60:.0f} мин — больше лимита "
-                    f"{self.config.audio.max_duration_seconds / 60:.0f} мин"
+                    f"{self.config.audio.max_duration_seconds / 60:.0f} мин "
+                    "(audio.max_duration_seconds в config.toml)"
                 )
+            return await self._start_track(
+                track, directive=directive, query=query, started=started
+            )
 
-            # Старый трек останавливаем только после успешного поиска нового.
-            await self._cancel_watch()
-            if previous is not None and not previous.finished.is_set():
+    async def _start_track(
+        self,
+        track: TrackInfo,
+        *,
+        start_ms: int = 0,
+        directive: str | None = None,
+        query: str = "",
+        started: float | None = None,
+        remember: bool = True,
+    ) -> dict[str, Any]:
+        """Собрать поток с ``start_ms`` и отдать его Станции.
+
+        Обычное включение — ``start_ms=0``; перемотка — та же песня, собранная
+        заново с нужной секунды (``ffmpeg -ss``), поэтому Content-Length и
+        позиция считаются от неё, а не от начала трека.
+        """
+        started = time.monotonic() if started is None else started
+        start_ms = max(0, int(start_ms))
+        start_s = start_ms / 1000.0
+        stream_s = max(0.001, float(track.duration) - start_s)
+
+        # 3. Расчёт конечного Content-Length и запуск конвейера.
+        content_length = int(
+            (stream_s + self.config.audio.padding_seconds)
+            * self.config.audio.bytes_per_second
+        )
+        if content_length < 16_384:
+            raise PlaybackError("Слишком короткий остаток трека для потоковой раздачи")
+
+        # Старый трек останавливаем только теперь, когда новый уже готов.
+        # Порядок как в _abort: сначала гасим сам поток (это отменяет
+        # производителя), и только потом ждём наблюдателя — иначе _cancel_watch
+        # висит все 6 секунд, пока производитель застрял в buffer.write
+        # (и перемотка на слух занимает лишние секунды).
+        previous = self.hub.current
+        if previous is not None:
+            if not previous.finished.is_set():
                 _LOGGER.info("Останавливаю предыдущий поток")
                 with contextlib.suppress(Exception):
                     await self.glagol.stop()
-                await self._terminate_session(previous)
-                self.hub.clear(previous)
+            previous.release_stream()
+            await self._terminate_session(previous)
+            await self._wait_stream_released(previous, _RELEASE_S)
+            self.hub.clear(previous)
+        await self._cancel_watch()
 
-            # 3. Расчёт конечного Content-Length и запуск конвейера.
-            content_length = int(
-                (track.duration + self.config.audio.padding_seconds)
-                * self.config.audio.bytes_per_second
+        token = secrets.token_urlsafe(18).replace("-", "").replace("_", "")
+        url = self.config.stream_url(token)
+        buffer = StreamBuffer(
+            max_buffer_bytes=max(
+                self.config.server.prebuffer_bytes + 131_072, 512 * 1024
             )
-            if content_length < 16_384:
-                raise PlaybackError("Слишком короткий трек для потоковой раздачи")
-            token = secrets.token_urlsafe(18).replace("-", "").replace("_", "")
-            url = self.config.stream_url(token)
-            buffer = StreamBuffer(
-                max_buffer_bytes=max(
-                    self.config.server.prebuffer_bytes + 131_072, 512 * 1024
-                )
-            )
-            session = StreamSession(
-                token=token,
-                url=url,
-                query=query,
-                title=track.title,
-                artist=track.artist,
-                duration=track.duration,
-                content_length=content_length,
-                buffer=buffer,
-            )
-            self.hub.install(session)
-            _LOGGER.info("play: новая сессия %s (%s)", token[:8], track.display_title)
-            session.producer_task = asyncio.create_task(
-                produce_mp3(
-                    self.config,
-                    self.resolver,
-                    track,
-                    buffer,
-                    content_length,
-                ),
-                name=f"audio-{token[:8]}",
-            )
-            self._watch_task = asyncio.create_task(
-                self._watch_producer(session), name=f"watch-{token[:8]}"
-            )
+        )
+        session = StreamSession(
+            token=token,
+            url=url,
+            query=query or track.query,
+            video_id=track.video_id,
+            title=track.title,
+            artist=track.artist,
+            duration=track.duration,
+            content_length=content_length,
+            buffer=buffer,
+            start_ms=start_ms,
+        )
+        self.hub.install(session)
+        _LOGGER.info(
+            "play: новая сессия %s (%s) с %.1f c",
+            token[:8],
+            track.display_title,
+            start_s,
+        )
+        session.producer_task = asyncio.create_task(
+            produce_mp3(
+                self.config,
+                self.resolver,
+                track,
+                buffer,
+                content_length,
+                start_seconds=start_s,
+            ),
+            name=f"audio-{token[:8]}",
+        )
+        self._watch_task = asyncio.create_task(
+            self._watch_producer(session), name=f"watch-{token[:8]}"
+        )
 
-            # 4. Ждём prebuffer, чтобы Станция не получила пустой HTTP-ответ.
-            target = min(self.config.server.prebuffer_bytes, content_length)
-            try:
-                level_ok = await buffer.wait_for_level(
-                    target, self.config.server.prebuffer_timeout
-                )
-                if buffer.error is not None:
-                    raise PlaybackError(f"Ошибка аудиопотока: {buffer.error}")
-                if session.producer_task.done():
-                    error = session.producer_task.exception()
-                    if error is not None:
-                        raise PlaybackError(f"Не удалось получить аудио: {error}")
-                if buffer.buffered_bytes <= 0:
-                    raise PlaybackError(
-                        "Аудиопоток не выдал данных за "
-                        f"{self.config.server.prebuffer_timeout:.0f} с "
-                        "(проверьте yt-dlp/ffmpeg и доступ к YouTube)"
-                    )
-                if not level_ok:
-                    _LOGGER.warning(
-                        "Prebuffer не достиг %d байт (есть %d), продолжаю: трек короткий",
-                        target,
-                        buffer.buffered_bytes,
-                    )
-            except PlaybackError:
-                await self._abort(session)
-                raise
-            except asyncio.CancelledError:
-                await self._abort(session)
-                raise
-
-            # 5. Команда Станции.
-            if self.config.playback.stop_before_play and previous is not None:
-                await asyncio.sleep(0.15)
-            try:
-                ack = await self.glagol.play(
-                    url,
-                    track.title,
-                    track.artist,
-                    directive=directive,
-                )
-            except Exception as exc:  # noqa: BLE001 - Glagol может упасть по-разному
-                await self._abort(session, stop_glagol=True)
-                if isinstance(exc, PlaybackError):
-                    raise
-                raise PlaybackError(f"Glagol: {exc}") from exc
-
-            # 6. Ждём, пока Станция откроет HTTP-поток. Это лучший индикатор,
-            # что команда принята и воспроизведение реально началось.
-            try:
-                await asyncio.wait_for(
-                    session.connected.wait(),
-                    self.config.server.station_connect_timeout,
-                )
-            except asyncio.TimeoutError as exc:
-                await self._abort(session, stop_glagol=True)
+        # 4. Ждём prebuffer, чтобы Станция не получила пустой HTTP-ответ.
+        target = min(self.config.server.prebuffer_bytes, content_length)
+        try:
+            level_ok = await buffer.wait_for_level(
+                target, self.config.server.prebuffer_timeout
+            )
+            if buffer.error is not None:
+                raise PlaybackError(f"Ошибка аудиопотока: {buffer.error}")
+            if session.producer_task.done():
+                error = session.producer_task.exception()
+                if error is not None:
+                    raise PlaybackError(f"Не удалось получить аудио: {error}")
+            if buffer.buffered_bytes <= 0:
                 raise PlaybackError(
-                    "Станция не подключилась к локальному HTTP-потоку за "
-                    f"{self.config.server.station_connect_timeout:.0f} с. "
-                    "Проверьте firewall, server.advertise_host и доступность "
-                    f"{url}"
-                ) from exc
+                    "Аудиопоток не выдал данных за "
+                    f"{self.config.server.prebuffer_timeout:.0f} с "
+                    "(проверьте yt-dlp/ffmpeg и доступ к YouTube)"
+                )
+            if not level_ok:
+                _LOGGER.warning(
+                    "Prebuffer не достиг %d байт (есть %d), продолжаю: трек короткий",
+                    target,
+                    buffer.buffered_bytes,
+                )
+        except PlaybackError:
+            await self._abort(session)
+            raise
+        except asyncio.CancelledError:
+            await self._abort(session)
+            raise
 
-            elapsed = time.monotonic() - started
-            self._played.append(track.video_id)
-            self._paused = False
-            _LOGGER.info(
-                "Играю %r (%s) — %.1f c, stream=%s",
-                track.display_title,
-                "audio_play" if directive == "audio_play" else "radio_play",
-                track.duration,
+        # 5. Команда Станции.
+        if self.config.playback.stop_before_play and previous is not None:
+            await asyncio.sleep(0.15)
+        try:
+            ack = await self.glagol.play(
                 url,
+                track.title,
+                track.artist,
+                directive=directive,
+                # Станция понимает offset_ms как позицию ВНУТРИ потока, а
+                # перемотанный поток уже начинается с start_ms: если отдать ей
+                # start_ms, она перескочит за конец короткого потока и сразу
+                # его завершит (проверено на живой Станции: offset=300 при
+                # 69-секундном потоке дал track_finished через 166 мс).
+                offset_ms=0,
             )
-            return {
-                "title": track.title,
-                "artist": track.artist,
-                "duration": round(track.duration, 2),
-                "query": query,
-                "stream_url": url,
-                "content_length": content_length,
-                "glagol": ack,
-                "startup_seconds": round(elapsed, 2),
-                "played_count": len(self._played),
-                "session": session.status(),
-            }
+        except Exception as exc:  # noqa: BLE001 - Glagol может упасть по-разному
+            await self._abort(session, stop_glagol=True)
+            if isinstance(exc, PlaybackError):
+                raise
+            raise PlaybackError(f"Glagol: {exc}") from exc
+
+        # 6. Ждём, пока Станция откроет HTTP-поток. Это лучший индикатор,
+        # что команда принята и воспроизведение реально началось.
+        try:
+            await asyncio.wait_for(
+                session.connected.wait(),
+                self.config.server.station_connect_timeout,
+            )
+        except asyncio.TimeoutError as exc:
+            await self._abort(session, stop_glagol=True)
+            raise PlaybackError(
+                "Станция не подключилась к локальному HTTP-потоку за "
+                f"{self.config.server.station_connect_timeout:.0f} с. "
+                "Проверьте firewall, server.advertise_host и доступность "
+                f"{url}"
+            ) from exc
+
+        elapsed = time.monotonic() - started
+        if remember and track.video_id not in self._played:
+            self._played.append(track.video_id)
+        self._paused = False
+        _LOGGER.info(
+            "Играю %r (%s) — %.1f c, stream=%s",
+            track.display_title,
+            "audio_play" if directive == "audio_play" else "radio_play",
+            track.duration,
+            url,
+        )
+        return {
+            "title": track.title,
+            "artist": track.artist,
+            "duration": round(track.duration, 2),
+            "query": query,
+            "start_ms": start_ms,
+            "stream_url": url,
+            "content_length": content_length,
+            "glagol": ack,
+            "startup_seconds": round(elapsed, 2),
+            "played_count": len(self._played),
+            "session": session.status(),
+        }
+
+    async def seek(self, position_ms: int) -> dict[str, Any]:
+        """Перемотать текущий трек на ``position_ms``.
+
+        Перемотка — это не перемещение по уже отданному потоку, а новый поток
+        той же песни с нужной секунды: только так Станция получает корректный
+        Content-Length и продолжает играть с этого места.
+        """
+        async with self._lock:
+            session = self.hub.current
+            if session is None:
+                return {"seeked": False, "reason": "nothing is playing"}
+            duration = float(session.duration or 0)
+            if duration <= 0:
+                return {"seeked": False, "reason": "unknown duration"}
+            limit_ms = max(0, int((duration - _SEEK_TAIL_S) * 1000))
+            pos_ms = max(0, min(int(position_ms), limit_ms))
+            track = TrackInfo(
+                video_id=session.video_id,
+                title=session.title,
+                artist=session.artist,
+                duration=duration,
+                webpage_url=f"https://www.youtube.com/watch?v={session.video_id}",
+                query=session.query,
+            )
+            _LOGGER.info("Перемотка: %s -> %.1f c", track.display_title, pos_ms / 1000.0)
+            try:
+                result = await self._start_track(
+                    track, start_ms=pos_ms, query=session.query, remember=False
+                )
+            except PlaybackError as exc:
+                _LOGGER.warning("Перемотка не удалась: %s", exc)
+                return {"seeked": False, "reason": str(exc)}
+            return {"seeked": True, "position_ms": pos_ms, **result}
 
     async def stop(self) -> dict[str, Any]:
         async with self._lock:
@@ -289,9 +386,21 @@ class PlaybackService:
             return {"paused": False, "reason": "nothing is playing"}
         if send_command is None:
             send_command = self.config.playback.pause_command
+        # Позицию паузы берём у Станции (playerState.progress) — она присылает
+        # её раз в секунду, и ровно с этой секунды трек потом продолжится.
+        # Часы этого не дают: Станция качает поток вперёд на минуты.
+        self._apply_station_state(session)
+        position = (
+            self._station_progress_ms(session)
+            if self._station_matches(session)
+            else None
+        )
+        if position is not None and position < 0:
+            position = None
         # Позицию паузы фиксируем РОВНО ОДИН раз: повторная «пауза»/«поставь на
         # паузу» её не двигает (иначе offset_ms уезжает вперёд на время простоя).
-        session.freeze_at_pause()
+        session.freeze_at_pause(position)
+        session.paused_by = "panel"
         if send_command:
             with contextlib.suppress(Exception):
                 await self.glagol.pause()
@@ -339,7 +448,15 @@ class PlaybackService:
         if session.cancelled:
             return {"resumed": False, "reason": "session cancelled"}
 
+        # Станция могла уже продолжить сама (кольцо/кнопка) — тогда ничего не
+        # делаем. Здесь же ловим паузу кольцом, если панель ещё не опрашивала.
+        self._apply_station_state(session)
+
         offset_bytes, offset_ms = session.resume_position()
+        # Станция считает offset_ms внутри отданного потока. У перемотанного
+        # трека начало потока — это уже секунда start_ms, поэтому отправляем
+        # разницу, а наружу (панели) отдаём абсолютную позицию, как у pause.
+        station_ms = max(0, offset_ms - session.start_ms)
 
         if session.finished.is_set():
             # Жёсткая пауза или поток закрыт: включаем трек заново.
@@ -359,12 +476,17 @@ class PlaybackService:
                 "replayed": False,
                 "reconnected": False,
                 "offset_ms": offset_ms,
+                "station_offset_ms": station_ms,
                 "offset_bytes": offset_bytes,
                 "sent_command": False,
                 "title": session.title,
             }
 
-        return await self._resume_reconnect(session, offset_bytes, offset_ms, why)
+        result = await self._resume_reconnect(session, offset_bytes, station_ms, why)
+        if "offset_ms" in result:
+            result["station_offset_ms"] = result["offset_ms"]
+            result["offset_ms"] = offset_ms
+        return result
 
     @staticmethod
     def _needs_reconnect(session: StreamSession, *, force: bool = False) -> tuple[bool, str]:
@@ -409,6 +531,7 @@ class PlaybackService:
         attempts = max(1, int(self.config.playback.resume_attempts))
         # До доказательства обратного считаем, что потока у Станции нет.
         session.paused = False
+        session.paused_by = ""
         session.consumer_claimed = False
         session.resume_offset = offset_bytes
         session.resume_epoch += 1  # старый handler больше не трогает состояние
@@ -445,6 +568,7 @@ class PlaybackService:
                 # Позицию зафиксировали в offset_ms — дальше её считает новое
                 # соединение станции (старт Range + время чтения).
                 session.played_ms = 0
+                session.reset_station_tracking()
                 self._paused = False
                 _LOGGER.info(
                     "Продолжение принято: Станция снова читает поток (url=%s, %.1f c)",
@@ -577,12 +701,97 @@ class PlaybackService:
         result = await self.glagol.volume_delta(step * self.config.playback.volume_step)
         return {**result, "step": step}
 
+    # ── состояние Станции (пауза кольцом, точная позиция) ───────────────
+    #
+    # Станция раз в секунду присылает по Glagol своё состояние: playing и
+    # playerState.progress. Это единственный достоверный источник позиции
+    # (байты в сокете опережают звук на минуты) и единственный признак паузы,
+    # нажатой кольцом: HTTP-поток при этом остаётся открытым.
+
+    # Сколько секунд Станция должна молчать, чтобы это считалось паузой.
+    _STATION_PAUSE_S = 1.5
+
+    def _station_matches(self, session: StreamSession) -> bool:
+        """Относится ли playerState Станции к нашему потоку.
+
+        Голосом можно включить радио, и тогда её progress/playing — про чужой
+        трек. Свой поток узнаём по длительности: у него она равна отданному
+        Content-Length (длительность трека плюс паддинг).
+        """
+        duration = self.glagol.state.player_state.get("duration")
+        if duration is None:
+            return True
+        try:
+            duration = float(duration)
+        except (TypeError, ValueError):
+            return True
+        if duration <= 0:
+            return False
+        return abs(duration - session.stream_duration) <= 6.0
+
+    def _station_progress_ms(
+        self, session: StreamSession, *, max_age: float = 5.0
+    ) -> int | None:
+        """Абсолютная позиция трека по ``playerState.progress`` Станции.
+
+        Старое значение не годится: если состояние перестало приходить,
+        лучше считать позицию по часам, чем продолжать с чужой секунды.
+        """
+        state = self.glagol.state
+        progress = state.progress_s
+        if progress is None or progress < 0:
+            return None
+        if state.progress_at and time.time() - state.progress_at > max_age:
+            return None
+        return session.start_ms + int(round(progress * 1000))
+
+    def _apply_station_state(self, session: StreamSession) -> bool:
+        """Обновить паузу/позицию по состоянию Станции. True — встала на паузу."""
+        if not self.glagol.state.connected:
+            return False
+        if not self._station_matches(session):
+            return False
+        return session.apply_station_state(
+            self.glagol.state.playing,
+            self._station_progress_ms(session),
+            pause_s=self._STATION_PAUSE_S,
+        )
+
+    async def _station_loop(self) -> None:
+        """Держать связь со Станцией и замечать её паузу/продолжение сразу.
+
+        Панель опрашивает статус раз в 3 с — этого хватает интерфейсу, но
+        состояние копим здесь: пауза кольцом должна попасть в позицию трека
+        даже если браузер закрыт, а «продолжай» не должно перезапускать трек.
+        """
+        while not self._closing:
+            await asyncio.sleep(1.0)
+            session = self.hub.current
+            if session is None:
+                continue
+            try:
+                if not self.glagol.state.connected:
+                    if time.monotonic() >= self._station_retry_at:
+                        self._station_retry_at = time.monotonic() + 10.0
+                        await self.glagol.connect()
+                    continue
+                self._apply_station_state(session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - связь может пропасть
+                _LOGGER.debug("Станция: состояние не обновлено: %r", exc)
+
     def status(self) -> dict[str, Any]:
         session = self.hub.current
+        stream = None
+        if session is not None:
+            self._apply_station_state(session)
+            stream = session.status()
         return {
             "service": "quasard-youtube",
             "ok": True,
-            "paused": self._paused,
+            # Пауза кольцом тоже пауза, даже если её поставила Станция, а не мы.
+            "paused": bool(self._paused or (stream and stream.get("paused"))),
             "queue": {"query": self._query, "played": len(self._played)},
             "station": {
                 "host": self.config.station.host,
@@ -590,9 +799,11 @@ class PlaybackService:
                 "device_id": self.config.station.device_id,
                 "connected": self.glagol.state.connected,
                 "audio_client": self.glagol.state.audio_client,
+                "playing": self.glagol.state.playing,
+                "progress_s": round(self.glagol.state.progress_s, 2),
                 "last_error": self.glagol.state.last_error,
             },
-            "stream": session.status() if session else None,
+            "stream": stream,
             "advertise_host": self._safe_advertise_host(),
         }
 

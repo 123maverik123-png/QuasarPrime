@@ -1,2 +1,4 @@
 aiohttp>=3.9
-yt-dlp>=2025.1.15
+# [default] тянет yt-dlp-ejs (JS-солвер подписи YouTube) — без него с куки
+# YouTube отдаёт видео без аудио-форматов. Версия ejs жёстко привязана к yt-dlp.
+yt-dlp[default]>=2025.1.15

@@ -77,6 +77,18 @@ class GlagolState:
     audio_client: bool = False
     player_type: str = ""
     playing: bool = False
+    # Когда Станция последний раз прислала «играет/не играет» и что именно.
+    # Это единственный достоверный признак того, что она реально звучит:
+    # пауза кольцом не закрывает HTTP-поток, байты просто перестают читаться.
+    playing_at: float = 0.0
+    player_state: dict[str, Any] = field(default_factory=dict)
+    # Позиция внутри отданного Станции потока (секунды) и его длительность:
+    # playerState.progress / playerState.duration. Для трека, собранного с
+    # середины (перемотка), progress начинается с нуля, а не с start_ms.
+    progress_s: float = -1.0
+    progress_at: float = 0.0
+    duration_s: float = 0.0
+    player_title: str = ""
     volume: float = 0.0
     last_message_at: float = 0.0
     last_error: str = ""
@@ -368,6 +380,51 @@ class GlagolClient:
             self.state.last_error = repr(exc)
             _LOGGER.warning("Glagol: ping остановлен: %r", exc)
 
+    def _apply_state(self, state: dict[str, Any]) -> None:
+        """Разобрать состояние проигрывателя, которое присылает Станция.
+
+        ``playing`` — главный признак: Станция присылает состояние при каждом
+        изменении воспроизведения, в том числе когда паузу нажали кольцом или
+        кнопкой, а не мы. Через HTTP-поток такую паузу не видно: соединение
+        остаётся открытым, байты просто перестают забираться.
+
+        ``playerState.progress`` — позиция внутри отданного потока (секунды),
+        точнее любых наших оценок по часам. После паузы Станция продолжает
+        присылать ``progress`` на замершем значении, так что по нему же
+        считается и позиция продолжения.
+        """
+        player = state.get("playerState")
+        if isinstance(player, dict):
+            self.state.player_state = dict(player)
+            self.state.player_type = str(player.get("playerType") or "")
+            self.state.player_title = str(player.get("title") or "")
+            with contextlib.suppress(TypeError, ValueError):
+                self.state.duration_s = float(player.get("duration") or 0.0)
+            progress = player.get("progress")
+            if progress is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    self.state.progress_s = float(progress)
+                    self.state.progress_at = time.time()
+        if "volume" in state:
+            with contextlib.suppress(TypeError, ValueError):
+                self.state.volume = float(state["volume"])
+        playing = state.get("playing")
+        if playing is None and isinstance(player, dict):
+            playing = player.get("playing")
+        if playing is None:
+            return
+        playing = bool(playing)
+        if playing != self.state.playing:
+            self.state.playing = playing
+            self.state.playing_at = time.time()
+            _LOGGER.info(
+                "Glagol: Станция %s (позиция %.1f c)",
+                "играет" if playing else "не играет",
+                self.state.progress_s,
+            )
+        elif not self.state.playing_at:
+            self.state.playing_at = time.time()
+
     def _handle_message(self, data: dict[str, Any]) -> None:
         self.state.last_message_at = time.time()
         features = data.get("supported_features")
@@ -377,13 +434,7 @@ class GlagolClient:
 
         state = data.get("state")
         if isinstance(state, dict):
-            self.state.playing = bool(state.get("playing", False))
-            if "volume" in state:
-                with contextlib.suppress(TypeError, ValueError):
-                    self.state.volume = float(state["volume"])
-            player = state.get("playerState")
-            if isinstance(player, dict):
-                self.state.player_type = str(player.get("playerType") or "")
+            self._apply_state(state)
 
         request_id = data.get("requestId")
         if request_id and request_id in self._pending:

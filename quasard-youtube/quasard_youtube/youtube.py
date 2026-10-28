@@ -12,10 +12,12 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 from .config import Config
+from .cookies import CookieFileInfo, inspect_cookies, js_solver_status, prepare_working_jar
 
 _LOGGER = logging.getLogger(__name__)
 _URL_HOSTS = {
@@ -59,6 +61,92 @@ class YoutubeResolver:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._command = self._find_ytdlp()
+        self._cookies_source: Path | None = None
+        self._cookie_note = ""
+        self._cookies = self._prepare_cookies()
+
+    def _prepare_cookies(self, *, announce: bool = True) -> Path | None:
+        """Рабочая копия файла куки для ``--cookies`` (``None`` — не передавать).
+
+        Отсутствие файла — норма: yt-dlp работает анонимно, как до появления
+        этой настройки. Битый файл тоже не должен ронять воспроизведение,
+        поэтому он просто игнорируется с предупреждением в логе.
+
+        yt-dlp перезаписывает ``--cookies`` при каждом запуске, поэтому ему
+        достаётся копия: исходный экспорт пользователя не меняется.
+
+        ``announce=False`` — повторная проверка перед запуском yt-dlp: файл
+        могли положить уже после старта сервиса, и тогда он подхватится без
+        перезапуска (сообщения в лог не повторяются).
+        """
+        configured = self.config.youtube.cookies_file.strip()
+        if not configured:
+            return None
+        if _extra_args_use_cookies(self.config.youtube.extra_args):
+            # Пользователь уже передал --cookies/--cookies-from-browser вручную.
+            if announce:
+                _LOGGER.info(
+                    "Куки: youtube.extra_args уже содержит флаг куки — "
+                    "youtube.cookies_file не применяется"
+                )
+            return None
+        path = self.config.resolve_cookies_file()
+        if path is None:
+            if announce:
+                _LOGGER.info(
+                    "Куки: файл %r не найден — yt-dlp работает без авторизации",
+                    configured,
+                )
+            return None
+        info = inspect_cookies(path)
+        if not info.valid:
+            if announce or info.detail != self._cookie_note:
+                _LOGGER.warning("Куки: %s игнорируется — %s", path, info.detail)
+            self._cookie_note = info.detail
+            return None
+        _LOGGER.info(
+            "Куки: %s (записей %d, youtube.com %d, %s)",
+            path,
+            info.entries,
+            info.youtube_entries,
+            "авторизация есть" if info.authorized else "авторизации нет",
+        )
+        if not info.authorized:
+            _LOGGER.warning(
+                "Куки: в файле нет SID/LOGIN_INFO — похоже, YouTube был не "
+                "залогинен при экспорте; ограничения YouTube это не снимет"
+            )
+        solver_ready, solver_detail = js_solver_status(self.config.youtube.extra_args)
+        if solver_ready:
+            _LOGGER.info("Куки: JS-солвер готов (%s)", solver_detail)
+        else:
+            # С куки YouTube отдаёт клиенту web, а он требует подписи форматов.
+            # Без солвера видео приходит без аудио — хуже, чем без авторизации.
+            _LOGGER.warning(
+                "Куки: %s. С авторизацией yt-dlp должен решать JS-задачу "
+                "YouTube, иначе форматов не будет («Аудиопоток пуст»). "
+                "См. docs/COOKIES.md, раздел про yt-dlp-ejs",
+                solver_detail,
+            )
+        self._cookies_source = path
+        return prepare_working_jar(path)
+
+    @property
+    def cookies_file(self) -> Path | None:
+        """Файл, который реально попадёт в ``--cookies`` (рабочая копия)."""
+        return self._cookies
+
+    @property
+    def cookies_source(self) -> Path | None:
+        """Исходный экспорт пользователя (для ``doctor`` и логов)."""
+        return self._cookies_source
+
+    def cookies_info(self) -> CookieFileInfo | None:
+        """Отчёт о файле куки для диагностики (``doctor``)."""
+        path = self._cookies_source or self.config.resolve_cookies_file()
+        if path is None:
+            return None
+        return inspect_cookies(path)
 
     def _find_ytdlp(self) -> list[str]:
         configured = self.config.youtube.yt_dlp_path.strip()
@@ -79,7 +167,11 @@ class YoutubeResolver:
         return list(self._command)
 
     def _base_args(self) -> list[str]:
-        return [
+        if self._cookies is None and self.config.youtube.cookies_file.strip():
+            # Файл могли положить уже после старта сервиса: подхватываем без
+            # перезапуска (повторный лог не пишем).
+            self._cookies = self._prepare_cookies(announce=False)
+        args = [
             *self._command,
             "--no-warnings",
             "--no-progress",
@@ -89,6 +181,11 @@ class YoutubeResolver:
             "3",
             *self.config.youtube.extra_args,
         ]
+        if self._cookies is not None:
+            # Один и тот же файл нужен и поиску/метаданным, и стриму:
+            # длинные треки без авторизации YouTube часто отдаёт неохотно.
+            args.extend(["--cookies", str(self._cookies)])
+        return args
 
     async def resolve(self, query: str, *, skip: frozenset[str] = frozenset()) -> TrackInfo:
         """Найти трек. ``skip`` — video_id, которые уже играли (для «следующей»)."""
@@ -259,6 +356,16 @@ def pick_fresh(raw: Any, query: str, skip: frozenset[str]) -> TrackInfo:
         "Больше нет подходящих результатов по запросу "
         f"(получено {len(entries)}, отклонено {rejected})"
     )
+
+
+def _extra_args_use_cookies(extra_args: list[str]) -> bool:
+    """Уже передан ли флаг куки вручную через ``youtube.extra_args``."""
+    for arg in extra_args:
+        if arg in {"--cookies", "--cookies-from-browser"}:
+            return True
+        if arg.startswith(("--cookies=", "--cookies-from-browser=")):
+            return True
+    return False
 
 
 def _subprocess_flags() -> dict[str, Any]:

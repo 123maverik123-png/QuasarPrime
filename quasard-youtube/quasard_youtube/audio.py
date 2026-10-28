@@ -16,13 +16,20 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _CHUNK = 32 * 1024
 
 
-def ffmpeg_args(config: Config) -> list[str]:
+def ffmpeg_args(config: Config, start_seconds: float = 0.0) -> list[str]:
     audio = config.audio
-    return [
+    args = [
         config.youtube.ffmpeg_path,
         "-hide_banner",
         "-loglevel",
         "warning",
+    ]
+    if start_seconds and start_seconds > 0:
+        # Перемотка: -ss перед -i. Вход — pipe, поэтому ffmpeg не ищет в файле,
+        # а пропускает пакеты до нужного времени, не декодируя их: это дешевле
+        # и точнее, чем -ss после -i (там пришлось бы декодировать всё начало).
+        args += ["-ss", f"{float(start_seconds):.3f}"]
+    args += [
         "-i",
         "pipe:0",
         "-vn",
@@ -34,6 +41,12 @@ def ffmpeg_args(config: Config) -> list[str]:
         str(audio.channels),
         "-ar",
         str(audio.sample_rate),
+    ]
+    # Громкость музыки: -af до кодера, чтобы уровень не зависел от YouTube.
+    gain_filter = audio.filter.strip()
+    if gain_filter:
+        args += ["-af", gain_filter]
+    args += [
         "-c:a",
         "libmp3lame",
         "-b:a",
@@ -52,6 +65,7 @@ def ffmpeg_args(config: Config) -> list[str]:
         "mp3",
         "pipe:1",
     ]
+    return args
 
 
 def _proc_kwargs() -> dict[str, int]:
@@ -140,9 +154,13 @@ async def produce_mp3(
     buffer: StreamBuffer,
     content_length: int,
     *,
+    start_seconds: float = 0.0,
     stop_event: asyncio.Event | None = None,
 ) -> int:
     """Запустить yt-dlp+ffmpeg и писать MP3 в буфер, пока не наберётся length.
+
+    ``start_seconds`` — с какой секунды трека начинать (перемотка): ffmpeg
+    пропускает начало потока, поэтому буфер сразу содержит нужное место.
 
     Возвращает число записанных байт. Ошибка поднимается только если не удалось
     получить ни одного байта; частичный поток добивается тишиной на HTTP-слое.
@@ -164,7 +182,7 @@ async def produce_mp3(
             **_proc_kwargs(),
         )
         ffmpeg = await asyncio.create_subprocess_exec(
-            *ffmpeg_args(config),
+            *ffmpeg_args(config, start_seconds),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
